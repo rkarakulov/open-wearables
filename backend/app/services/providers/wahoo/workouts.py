@@ -67,6 +67,23 @@ class WahooWorkouts(BaseWorkoutsTemplate):
                     params={"page": page, "per_page": per_page},
                 )
                 workouts = _extract_workouts(response)
+                # TEMP DIAGNOSTIC: what did the Wahoo API actually return for this token?
+                log_structured(
+                    self.logger,
+                    "info",
+                    "Wahoo raw workouts page fetched",
+                    provider="wahoo",
+                    action="wahoo_raw_page",
+                    page=page,
+                    user_id=str(user_id),
+                    raw_count=len(workouts),
+                    envelope_type=type(response).__name__,
+                    response_keys=sorted(response.keys()) if isinstance(response, dict) else None,
+                    sample_starts=[w.get("starts") for w in workouts[:5]],
+                    sample_ids=[w.get("id") for w in workouts[:5]],
+                    window_start=str(start_date),
+                    window_end=str(end_date),
+                )
             except Exception as e:
                 log_structured(
                     self.logger,
@@ -109,6 +126,16 @@ class WahooWorkouts(BaseWorkoutsTemplate):
                 break
             page += 1
 
+        # TEMP DIAGNOSTIC: how many survived the [start,end] window filter.
+        log_structured(
+            self.logger,
+            "info",
+            "Wahoo workouts after window filter",
+            provider="wahoo",
+            action="wahoo_filtered_total",
+            user_id=str(user_id),
+            kept_count=len(all_workouts),
+        )
         return all_workouts
 
     def get_workouts_from_api(self, db: DbSession, user_id: UUID, **kwargs: Any) -> Any:

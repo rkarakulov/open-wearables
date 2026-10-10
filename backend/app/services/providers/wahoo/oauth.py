@@ -1,3 +1,5 @@
+import logging
+
 import httpx
 
 from app.config import settings
@@ -16,6 +18,8 @@ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 _WAHOO_USER_ENDPOINT = "/v1/user"
 # Wahoo has no POST /oauth/revoke; DELETE /v1/permissions revokes the grant (Bearer-authenticated).
 _WAHOO_PERMISSIONS_ENDPOINT = "/v1/permissions"
+
+logger = logging.getLogger(__name__)
 
 
 class WahooOAuth(BaseOAuthTemplate):
@@ -70,6 +74,15 @@ class WahooOAuth(BaseOAuthTemplate):
             user_data = response.json()
             provider_user_id = user_data.get("id")
             provider_user_id = str(provider_user_id) if provider_user_id is not None else None
+            # TEMP DIAGNOSTIC: identify which Wahoo account was authorized.
+            logger.info(
+                "wahoo.oauth.user_info wahoo_user_id=%s email=%s first=%s keys=%s",
+                provider_user_id,
+                user_data.get("email"),
+                user_data.get("first"),
+                sorted(user_data.keys()) if isinstance(user_data, dict) else None,
+            )
             return {"user_id": provider_user_id, "username": None}
-        except Exception:
+        except Exception as exc:
+            logger.warning("wahoo.oauth.user_info_failed error=%s", str(exc))
             return {"user_id": None, "username": None}
