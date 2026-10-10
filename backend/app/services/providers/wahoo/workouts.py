@@ -3,6 +3,8 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
+
 from app.config import settings
 from app.constants.entry_source import get_unified_wahoo_entry_source
 from app.constants.workout_types import get_unified_wahoo_workout_type
@@ -15,7 +17,9 @@ from app.schemas.model_crud.activities import (
 )
 from app.schemas.providers.wahoo import WahooWorkoutJSON, WahooWorkoutSummaryJSON
 from app.services.event_record_service import event_record_service
+from app.services.fit_parser import parse_fit_file
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
+from app.services.raw_payload_storage import store_fit_file
 from app.utils.structured_logging import log_structured
 
 _WORKOUT_LIST_KEYS = ("workouts", "data", "results")
@@ -67,23 +71,6 @@ class WahooWorkouts(BaseWorkoutsTemplate):
                     params={"page": page, "per_page": per_page},
                 )
                 workouts = _extract_workouts(response)
-                # TEMP DIAGNOSTIC: what did the Wahoo API actually return for this token?
-                log_structured(
-                    self.logger,
-                    "info",
-                    "Wahoo raw workouts page fetched",
-                    provider="wahoo",
-                    action="wahoo_raw_page",
-                    page=page,
-                    user_id=str(user_id),
-                    raw_count=len(workouts),
-                    envelope_type=type(response).__name__,
-                    response_keys=sorted(response.keys()) if isinstance(response, dict) else None,
-                    sample_starts=[w.get("starts") for w in workouts[:5]],
-                    sample_ids=[w.get("id") for w in workouts[:5]],
-                    window_start=str(start_date),
-                    window_end=str(end_date),
-                )
             except Exception as e:
                 log_structured(
                     self.logger,
@@ -126,16 +113,6 @@ class WahooWorkouts(BaseWorkoutsTemplate):
                 break
             page += 1
 
-        # TEMP DIAGNOSTIC: how many survived the [start,end] window filter.
-        log_structured(
-            self.logger,
-            "info",
-            "Wahoo workouts after window filter",
-            provider="wahoo",
-            action="wahoo_filtered_total",
-            user_id=str(user_id),
-            kept_count=len(all_workouts),
-        )
         return all_workouts
 
     def get_workouts_from_api(self, db: DbSession, user_id: UUID, **kwargs: Any) -> Any:
@@ -251,6 +228,93 @@ class WahooWorkouts(BaseWorkoutsTemplate):
 
         return record, detail
 
+    def _resolve_fit_url(self, raw_workout: WahooWorkoutJSON) -> str | None:
+        """Extract the FIT file download URL from `workout_summary.file.url`, if present."""
+        summary = raw_workout.workout_summary
+        if summary is None or not summary.file:
+            return None
+        url = summary.file.get("url")
+        return url if isinstance(url, str) and url else None
+
+    def _download_fit_bytes(self, url: str) -> bytes | None:
+        """Download a workout FIT file from Wahoo's CDN URL.
+
+        No Authorization header: the URL is a short-lived, pre-signed CDN link,
+        not an authenticated Wahoo API call.
+        """
+        try:
+            response = httpx.get(url, timeout=settings.provider_request_timeout_seconds, follow_redirects=True)
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPError as e:
+            log_structured(
+                self.logger,
+                "warning",
+                "Failed to download Wahoo FIT file",
+                provider="wahoo",
+                action="wahoo_fit_download_failed",
+                error=str(e),
+            )
+            return None
+
+    def _enrich_workout_with_fit(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        raw_workout: WahooWorkoutJSON,
+        record_id: UUID,
+    ) -> None:
+        """Best-effort FIT enrichment: hr_zones/power_zones/segments onto the workout detail.
+
+        The base workout (from workout_summary JSON averages) is already saved by the
+        time this runs, so any failure here is logged and swallowed — it must never
+        break workout ingestion.
+
+        NOTE: some Wahoo FIT files carry left/right power balance and pedal smoothness,
+        but OW's EventRecordDetail/fit_parser don't model those fields — out of scope here.
+        """
+        activity_id = str(raw_workout.id)
+        try:
+            fit_url = self._resolve_fit_url(raw_workout)
+            if fit_url is None:
+                # The list endpoint may omit workout_summary.file; fetch the full detail.
+                detail_raw = self.get_workout_detail_from_api(db, user_id, activity_id)
+                if isinstance(detail_raw, dict):
+                    fit_url = self._resolve_fit_url(WahooWorkoutJSON(**detail_raw))
+
+            if fit_url is None:
+                return
+
+            fit_bytes = self._download_fit_bytes(fit_url)
+            if fit_bytes is None:
+                return
+
+            store_fit_file(provider="wahoo", fit_bytes=fit_bytes, user_id=str(user_id), activity_id=activity_id)
+            fit_result = parse_fit_file(fit_bytes, user_id, source="wahoo")
+
+            if not (fit_result.segments or fit_result.hr_zones or fit_result.power_zones):
+                return
+
+            fields: dict[str, Any] = {"segments": fit_result.segments}
+            if fit_result.hr_zones is not None:
+                fields["hr_zones"] = fit_result.hr_zones.model_dump()
+            if fit_result.power_zones is not None:
+                fields["power_zones"] = fit_result.power_zones.model_dump()
+
+            event_record_service.event_record_detail_repo.update_workout_fields(db, record_id, fields)
+            db.commit()
+        except Exception as e:
+            log_structured(
+                self.logger,
+                "warning",
+                "Wahoo FIT enrichment failed, skipping",
+                provider="wahoo",
+                action="wahoo_fit_enrichment_failed",
+                user_id=str(user_id),
+                activity_id=activity_id,
+                error=str(e),
+            )
+
     def load_data(
         self,
         db: DbSession,
@@ -306,6 +370,7 @@ class WahooWorkouts(BaseWorkoutsTemplate):
             created_record = event_record_service.create(db, record)
             detail_for_record = detail.model_copy(update={"record_id": created_record.id})
             event_record_service.create_detail(db, detail_for_record)
+            self._enrich_workout_with_fit(db, user_id, workout, created_record.id)
             count += 1
 
         return count
@@ -333,5 +398,6 @@ class WahooWorkouts(BaseWorkoutsTemplate):
         detail_for_record = detail.model_copy(update={"record_id": created_record.id})
         event_record_service.create_detail(db, detail_for_record)
         created_ids.append(created_record.id)
+        self._enrich_workout_with_fit(db, user_id, workout, created_record.id)
 
         return created_ids
