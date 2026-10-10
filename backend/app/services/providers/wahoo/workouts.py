@@ -15,11 +15,13 @@ from app.schemas.model_crud.activities import (
     EventRecordDetailCreate,
     EventRecordMetrics,
 )
+from app.schemas.model_crud.activities.data_point_series import TimeSeriesSampleCreate
 from app.schemas.providers.wahoo import WahooWorkoutJSON, WahooWorkoutSummaryJSON
 from app.services.event_record_service import event_record_service
 from app.services.fit_parser import parse_fit_file, session_metrics_fields
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.raw_payload_storage import store_fit_file
+from app.services.timeseries_service import timeseries_service
 from app.utils.structured_logging import log_structured
 
 _WORKOUT_LIST_KEYS = ("workouts", "data", "results")
@@ -264,6 +266,37 @@ class WahooWorkouts(BaseWorkoutsTemplate):
             )
             return None
 
+    def _persist_workout_samples(
+        self,
+        db: DbSession,
+        samples: list[TimeSeriesSampleCreate],
+        activity_id: str,
+    ) -> None:
+        """Best-effort persistence of per-second FIT samples (power/speed/HR/cadence/elevation/lat/long).
+
+        Reuses the same `timeseries_service.bulk_create_samples` ingestion path as the
+        Garmin/Strava FIT-derived samples, so Wahoo workouts get timeseries data for
+        stream charts and the route map. Runs in a nested savepoint so a failed bulk
+        insert rolls back only the samples and leaves the outer workout-detail
+        transaction (hr_zones/power_zones/segments/session metrics) usable.
+        """
+        nested = db.begin_nested()
+        try:
+            timeseries_service.bulk_create_samples(db, samples)
+            nested.commit()
+        except Exception as e:
+            nested.rollback()
+            log_structured(
+                self.logger,
+                "warning",
+                "Wahoo workout sample ingestion failed, skipping",
+                provider="wahoo",
+                action="wahoo_sample_ingestion_failed",
+                activity_id=activity_id,
+                sample_count=len(samples),
+                error=str(e),
+            )
+
     def _enrich_workout_with_fit(
         self,
         db: DbSession,
@@ -273,7 +306,8 @@ class WahooWorkouts(BaseWorkoutsTemplate):
     ) -> None:
         """Best-effort FIT enrichment: hr_zones/power_zones/segments/session metrics
         (max power/speed/elevation, L/R balance, pedal smoothness, torque
-        effectiveness) onto the workout detail.
+        effectiveness) onto the workout detail, plus per-second timeseries samples
+        when `settings.ingest_workout_samples` is enabled.
 
         The base workout (from workout_summary JSON averages) is already saved by the
         time this runs, so any failure here is logged and swallowed — it must never
@@ -297,6 +331,9 @@ class WahooWorkouts(BaseWorkoutsTemplate):
 
             store_fit_file(provider="wahoo", fit_bytes=fit_bytes, user_id=str(user_id), activity_id=activity_id)
             fit_result = parse_fit_file(fit_bytes, user_id, source="wahoo")
+
+            if settings.ingest_workout_samples and fit_result.samples:
+                self._persist_workout_samples(db, fit_result.samples, activity_id)
 
             if not (fit_result.segments or fit_result.hr_zones or fit_result.power_zones or fit_result.session_metrics):
                 return

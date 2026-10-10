@@ -1,12 +1,16 @@
 """Tests for Wahoo FIT-file enrichment (hr_zones / power_zones / segments / session metrics)."""
 
+from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import httpx
 import pytest
 
+from app.schemas.enums.series_types import SeriesType
+from app.schemas.model_crud.activities.data_point_series import TimeSeriesSampleCreate
 from app.schemas.model_crud.activities.zones import HRZone, HRZones, PowerZone, PowerZones
 from app.schemas.providers.wahoo import WahooWorkoutJSON, WahooWorkoutSummaryJSON
 from app.services.fit_parser import FitParseResult, SessionMetrics
@@ -235,3 +239,151 @@ class TestWahooFitEnrichment:
             assert result == b"FIT_BYTES"
             _, kwargs = mock_get.call_args
             assert "headers" not in kwargs
+
+
+class TestWahooWorkoutSamplePersistence:
+    """Tests for per-second FIT sample persistence, gated on `settings.ingest_workout_samples`."""
+
+    @pytest.fixture
+    def workouts(self) -> WahooWorkouts:
+        oauth = WahooOAuth(
+            user_repo=MagicMock(),
+            connection_repo=MagicMock(),
+            provider_name="wahoo",
+            api_base_url="https://api.wahooligan.com",
+        )
+        return WahooWorkouts(
+            workout_repo=MagicMock(),
+            connection_repo=MagicMock(),
+            provider_name="wahoo",
+            api_base_url="https://api.wahooligan.com",
+            oauth=oauth,
+        )
+
+    def _workout(self, *, file_url: str | None = "https://cdn.wahooligan.com/fit/abc.fit") -> WahooWorkoutJSON:
+        summary = WahooWorkoutSummaryJSON(file={"url": file_url} if file_url else None)
+        return WahooWorkoutJSON(
+            id=12345,
+            name="Morning Ride",
+            starts="2024-01-15T06:00:00Z",
+            minutes=60.0,
+            workout_type_id=0,
+            workout_summary=summary,
+        )
+
+    def _samples(self, user_id: Any) -> list[TimeSeriesSampleCreate]:
+        return [
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                source="wahoo",
+                recorded_at=datetime(2024, 1, 15, 6, 0, 0, tzinfo=timezone.utc),
+                value=Decimal("200"),
+                series_type=SeriesType.power,
+            )
+        ]
+
+    @patch("app.services.providers.wahoo.workouts.event_record_service")
+    @patch("app.services.providers.wahoo.workouts.store_fit_file")
+    @patch("app.services.providers.wahoo.workouts.parse_fit_file")
+    @patch("app.services.providers.wahoo.workouts.timeseries_service")
+    def test_flag_on_persists_samples_via_timeseries_service(
+        self,
+        mock_timeseries_service: MagicMock,
+        mock_parse_fit_file: MagicMock,
+        mock_store_fit_file: MagicMock,
+        mock_event_record_service: MagicMock,
+        workouts: WahooWorkouts,
+    ) -> None:
+        """With the flag on and samples present, bulk_create_samples is called with the parsed samples."""
+        user_id = uuid4()
+        samples = self._samples(user_id)
+        mock_parse_fit_file.return_value = FitParseResult(samples=samples)
+        workouts._download_fit_bytes = MagicMock(return_value=b"FIT_BYTES")
+        db = MagicMock()
+
+        with patch("app.services.providers.wahoo.workouts.settings", ingest_workout_samples=True):
+            workouts._enrich_workout_with_fit(db=db, user_id=user_id, raw_workout=self._workout(), record_id=uuid4())
+
+        mock_timeseries_service.bulk_create_samples.assert_called_once_with(db, samples)
+        db.begin_nested.return_value.commit.assert_called_once()
+        db.begin_nested.return_value.rollback.assert_not_called()
+
+    @patch("app.services.providers.wahoo.workouts.event_record_service")
+    @patch("app.services.providers.wahoo.workouts.store_fit_file")
+    @patch("app.services.providers.wahoo.workouts.parse_fit_file")
+    @patch("app.services.providers.wahoo.workouts.timeseries_service")
+    def test_flag_off_does_not_persist_samples(
+        self,
+        mock_timeseries_service: MagicMock,
+        mock_parse_fit_file: MagicMock,
+        mock_store_fit_file: MagicMock,
+        mock_event_record_service: MagicMock,
+        workouts: WahooWorkouts,
+    ) -> None:
+        """With the flag off, bulk_create_samples must NOT be called even if samples were parsed."""
+        user_id = uuid4()
+        samples = self._samples(user_id)
+        mock_parse_fit_file.return_value = FitParseResult(samples=samples)
+        workouts._download_fit_bytes = MagicMock(return_value=b"FIT_BYTES")
+
+        with patch("app.services.providers.wahoo.workouts.settings", ingest_workout_samples=False):
+            workouts._enrich_workout_with_fit(
+                db=MagicMock(), user_id=user_id, raw_workout=self._workout(), record_id=uuid4()
+            )
+
+        mock_timeseries_service.bulk_create_samples.assert_not_called()
+
+    @patch("app.services.providers.wahoo.workouts.event_record_service")
+    @patch("app.services.providers.wahoo.workouts.store_fit_file")
+    @patch("app.services.providers.wahoo.workouts.parse_fit_file")
+    @patch("app.services.providers.wahoo.workouts.timeseries_service")
+    def test_flag_on_with_no_samples_does_not_persist(
+        self,
+        mock_timeseries_service: MagicMock,
+        mock_parse_fit_file: MagicMock,
+        mock_store_fit_file: MagicMock,
+        mock_event_record_service: MagicMock,
+        workouts: WahooWorkouts,
+    ) -> None:
+        """Flag on but the FIT had no parseable samples: bulk_create_samples is not called."""
+        mock_parse_fit_file.return_value = FitParseResult(samples=[])
+        workouts._download_fit_bytes = MagicMock(return_value=b"FIT_BYTES")
+
+        with patch("app.services.providers.wahoo.workouts.settings", ingest_workout_samples=True):
+            workouts._enrich_workout_with_fit(
+                db=MagicMock(), user_id=uuid4(), raw_workout=self._workout(), record_id=uuid4()
+            )
+
+        mock_timeseries_service.bulk_create_samples.assert_not_called()
+
+    @patch("app.services.providers.wahoo.workouts.event_record_service")
+    @patch("app.services.providers.wahoo.workouts.store_fit_file")
+    @patch("app.services.providers.wahoo.workouts.parse_fit_file")
+    @patch("app.services.providers.wahoo.workouts.timeseries_service")
+    def test_sample_persistence_failure_does_not_block_detail_update(
+        self,
+        mock_timeseries_service: MagicMock,
+        mock_parse_fit_file: MagicMock,
+        mock_store_fit_file: MagicMock,
+        mock_event_record_service: MagicMock,
+        workouts: WahooWorkouts,
+    ) -> None:
+        """Sample persistence raising is isolated: segments/zones are still saved and committed."""
+        user_id = uuid4()
+        samples = self._samples(user_id)
+        segments = [{"kind": "lap", "index": 0, "elapsed_seconds": 600}]
+        mock_parse_fit_file.return_value = FitParseResult(samples=samples, segments=segments)
+        mock_timeseries_service.bulk_create_samples.side_effect = RuntimeError("db write failure")
+        workouts._download_fit_bytes = MagicMock(return_value=b"FIT_BYTES")
+        db = MagicMock()
+        record_id = uuid4()
+
+        with patch("app.services.providers.wahoo.workouts.settings", ingest_workout_samples=True):
+            workouts._enrich_workout_with_fit(db=db, user_id=user_id, raw_workout=self._workout(), record_id=record_id)
+
+        db.begin_nested.return_value.rollback.assert_called_once()
+        update_mock = mock_event_record_service.event_record_detail_repo.update_workout_fields
+        update_mock.assert_called_once()
+        assert update_mock.call_args.args[2]["segments"] == segments
+        db.commit.assert_called_once()
