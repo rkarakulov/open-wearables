@@ -266,6 +266,14 @@ class Settings(BaseSettings):
     withings_webhook_token: SecretStr | None = None
     withings_default_scope: str = "user.info,user.metrics,user.activity"
 
+    # WAHOO OAUTH SETTINGS
+    wahoo_client_id: str | None = None
+    wahoo_client_secret: SecretStr | None = None
+    wahoo_default_scope: str = "user_read workouts_read offline_data"
+    wahoo_webhook_token: SecretStr | None = None
+    # Wahoo's GET /v1/workouts has no since-cursor; paginate client-side.
+    wahoo_events_per_page: int = 30
+
     # EMAIL SETTINGS (SMTP is used when SMTP_HOST is set, otherwise Resend)
     resend_api_key: SecretStr | None = None
     smtp_host: str | None = None

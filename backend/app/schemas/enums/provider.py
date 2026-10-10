@@ -18,6 +18,7 @@ class ProviderName(str, Enum):
     ULTRAHUMAN = "ultrahuman"
     SENSORBIO = "sensorbio"
     WITHINGS = "withings"
+    WAHOO = "wahoo"
     UNKNOWN = "unknown"
     INTERNAL = "internal"
 
