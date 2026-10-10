@@ -57,6 +57,13 @@ class WahooWorkouts(BaseWorkoutsTemplate):
         Wahoo's `/v1/workouts` has no since-cursor, so every page is fetched and
         filtered client-side by `starts` against [start_date, end_date].
         """
+        # Normalize bounds to aware UTC: _parse_starts() returns tz-aware datetimes,
+        # while callers (periodic sync / explicit start_date) may pass naive ones —
+        # comparing the two raises "can't compare offset-naive and offset-aware".
+        if start_date is not None and start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+        if end_date is not None and end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
         all_workouts: list[dict[str, Any]] = []
         page = 1
         per_page = self.events_per_page
