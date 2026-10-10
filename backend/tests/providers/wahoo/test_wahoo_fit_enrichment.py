@@ -1,5 +1,6 @@
-"""Tests for Wahoo FIT-file enrichment (hr_zones / power_zones / segments)."""
+"""Tests for Wahoo FIT-file enrichment (hr_zones / power_zones / segments / session metrics)."""
 
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -8,7 +9,7 @@ import pytest
 
 from app.schemas.model_crud.activities.zones import HRZone, HRZones, PowerZone, PowerZones
 from app.schemas.providers.wahoo import WahooWorkoutJSON, WahooWorkoutSummaryJSON
-from app.services.fit_parser import FitParseResult
+from app.services.fit_parser import FitParseResult, SessionMetrics
 from app.services.providers.wahoo.oauth import WahooOAuth
 from app.services.providers.wahoo.workouts import WahooWorkouts
 
@@ -96,6 +97,71 @@ class TestWahooFitEnrichment:
         assert fields["segments"] == segments
         assert fields["hr_zones"] == hr_zones.model_dump()
         assert fields["power_zones"] == power_zones.model_dump()
+
+    @patch("app.services.providers.wahoo.workouts.event_record_service")
+    @patch("app.services.providers.wahoo.workouts.store_fit_file")
+    @patch("app.services.providers.wahoo.workouts.parse_fit_file")
+    def test_enrich_updates_detail_with_session_power_metrics(
+        self,
+        mock_parse_fit_file: MagicMock,
+        mock_store_fit_file: MagicMock,
+        mock_event_record_service: MagicMock,
+        workouts: WahooWorkouts,
+    ) -> None:
+        """Session-level power metrics (max power/speed/elevation, L/R balance, pedal/torque %) are persisted."""
+        session_metrics = SessionMetrics(
+            max_watts=Decimal("450"),
+            max_speed=Decimal("12.5"),
+            elev_high=Decimal("250"),
+            elev_low=Decimal("180"),
+            left_right_balance=Decimal("52"),
+            avg_left_pedal_smoothness=Decimal("20.5"),
+            avg_right_pedal_smoothness=Decimal("21.5"),
+            avg_left_torque_effectiveness=Decimal("80"),
+            avg_right_torque_effectiveness=Decimal("82"),
+        )
+        mock_parse_fit_file.return_value = FitParseResult(session_metrics=session_metrics)
+        workouts._download_fit_bytes = MagicMock(return_value=b"FIT_BYTES")
+
+        record_id = uuid4()
+        workouts._enrich_workout_with_fit(
+            db=MagicMock(), user_id=uuid4(), raw_workout=self._workout(), record_id=record_id
+        )
+
+        update_mock = mock_event_record_service.event_record_detail_repo.update_workout_fields
+        update_mock.assert_called_once()
+        call_args = update_mock.call_args.args
+        assert call_args[1] == record_id
+        fields = call_args[2]
+        assert fields["max_watts"] == Decimal("450")
+        assert fields["max_speed"] == Decimal("12.5")
+        assert fields["elev_high"] == Decimal("250")
+        assert fields["elev_low"] == Decimal("180")
+        assert fields["left_right_balance"] == Decimal("52")
+        assert fields["avg_left_pedal_smoothness"] == Decimal("20.5")
+        assert fields["avg_right_pedal_smoothness"] == Decimal("21.5")
+        assert fields["avg_left_torque_effectiveness"] == Decimal("80")
+        assert fields["avg_right_torque_effectiveness"] == Decimal("82")
+
+    @patch("app.services.providers.wahoo.workouts.event_record_service")
+    @patch("app.services.providers.wahoo.workouts.store_fit_file")
+    @patch("app.services.providers.wahoo.workouts.parse_fit_file")
+    def test_enrich_runs_when_only_session_metrics_present(
+        self,
+        mock_parse_fit_file: MagicMock,
+        mock_store_fit_file: MagicMock,
+        mock_event_record_service: MagicMock,
+        workouts: WahooWorkouts,
+    ) -> None:
+        """Detail update fires even when segments/zones are absent but session metrics were parsed."""
+        mock_parse_fit_file.return_value = FitParseResult(session_metrics=SessionMetrics(max_watts=Decimal("300")))
+        workouts._download_fit_bytes = MagicMock(return_value=b"FIT_BYTES")
+
+        workouts._enrich_workout_with_fit(
+            db=MagicMock(), user_id=uuid4(), raw_workout=self._workout(), record_id=uuid4()
+        )
+
+        mock_event_record_service.event_record_detail_repo.update_workout_fields.assert_called_once()
 
     @patch("app.services.providers.wahoo.workouts.event_record_service")
     @patch("app.services.providers.wahoo.workouts.store_fit_file")

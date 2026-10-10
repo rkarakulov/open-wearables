@@ -60,6 +60,15 @@ class Workout(BaseModel):
     moving_time_seconds: int | None = None
     elev_high: float | None = None
     elev_low: float | None = None
+    left_right_balance: float | None = Field(
+        None,
+        description="Right-pedal power contribution %, from the FIT session message.",
+        examples=[48.5],
+    )
+    avg_left_pedal_smoothness: float | None = None
+    avg_right_pedal_smoothness: float | None = None
+    avg_left_torque_effectiveness: float | None = None
+    avg_right_torque_effectiveness: float | None = None
     hr_zones: HRZones | None = None
     power_zones: PowerZones | None = None
     segments: list[dict] | None = None

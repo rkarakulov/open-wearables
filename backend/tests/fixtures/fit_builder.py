@@ -229,3 +229,92 @@ def make_swimming_fit(n_records: int = 10) -> bytes:
     for i in range(n_records):
         messages += _data_msg(fields, [start_ts + i, 140 + i % 8])
     return _fit_file(messages)
+
+
+# Session message (global_mesg_num=18) fields used for the cycling power-meter fixture:
+#   253  timestamp                        uint32  (FIT epoch seconds — end of session)
+#    15  max_speed                        uint16  (raw = m/s * 1000)
+#    21  max_power                        uint16  (watts, no scale)
+#    50  max_altitude                     uint16  (raw = (meters + 500) * 5)
+#    71  min_altitude                     uint16  (raw = (meters + 500) * 5)
+#    37  left_right_balance               uint16  (bitfield: 0x8000 "right" flag | pct * 100)
+#   101  avg_left_torque_effectiveness    uint8   (raw = pct * 2)
+#   102  avg_right_torque_effectiveness   uint8   (raw = pct * 2)
+#   103  avg_left_pedal_smoothness        uint8   (raw = pct * 2)
+#   104  avg_right_pedal_smoothness       uint8   (raw = pct * 2)
+_SESSION_POWER_FIELDS: list[_Field] = [
+    _Field(253, _UINT32, 4),
+    _Field(15, _UINT16, 2),
+    _Field(21, _UINT16, 2),
+    _Field(50, _UINT16, 2),
+    _Field(71, _UINT16, 2),
+    _Field(37, _UINT16, 2),
+    _Field(101, _UINT8, 1),
+    _Field(102, _UINT8, 1),
+    _Field(103, _UINT8, 1),
+    _Field(104, _UINT8, 1),
+]
+
+
+def _session_message(
+    ts: int,
+    max_speed_raw: int,
+    max_power: int,
+    max_altitude_raw: int,
+    min_altitude_raw: int,
+    left_right_balance_raw: int,
+    avg_left_torque_eff_raw: int,
+    avg_right_torque_eff_raw: int,
+    avg_left_smoothness_raw: int,
+    avg_right_smoothness_raw: int,
+    local_type: int = 1,
+) -> bytes:
+    """Build a single FIT session message (global_mesg_num=18)."""
+    out = _definition_msg(_SESSION_POWER_FIELDS, local_type=local_type, global_num=18)
+    out += _data_msg(
+        _SESSION_POWER_FIELDS,
+        [
+            ts,
+            max_speed_raw,
+            max_power,
+            max_altitude_raw,
+            min_altitude_raw,
+            left_right_balance_raw,
+            avg_left_torque_eff_raw,
+            avg_right_torque_eff_raw,
+            avg_left_smoothness_raw,
+            avg_right_smoothness_raw,
+        ],
+        local_type=local_type,
+    )
+    return out
+
+
+def make_cycling_power_fit(n_records: int = 10) -> bytes:
+    """Synthetic outdoor cycling ride with a power meter: HR records plus a FIT
+    session message carrying max power/speed/elevation and left/right power-balance
+    dynamics (left_right_balance, pedal smoothness, torque effectiveness).
+    """
+    fields = [
+        _Field(253, _UINT32, 4),
+        _Field(3, _UINT8, 1),
+    ]
+    start_ts = _fit_ts(datetime(2025, 6, 4, 9, 0, 0, tzinfo=timezone.utc))
+    messages = _definition_msg(fields)
+    for i in range(n_records):
+        messages += _data_msg(fields, [start_ts + i, 140 + i % 10])
+
+    end_ts = start_ts + n_records
+    messages += _session_message(
+        ts=end_ts,
+        max_speed_raw=12500,  # 12.5 m/s
+        max_power=450,  # 450 W
+        max_altitude_raw=3750,  # 250 m
+        min_altitude_raw=3400,  # 180 m
+        left_right_balance_raw=(5200 | 0x8000),  # right flag set, 52.00%
+        avg_left_torque_eff_raw=160,  # 80.0%
+        avg_right_torque_eff_raw=164,  # 82.0%
+        avg_left_smoothness_raw=41,  # 20.5%
+        avg_right_smoothness_raw=43,  # 21.5%
+    )
+    return _fit_file(messages)

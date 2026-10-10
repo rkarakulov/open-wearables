@@ -6,9 +6,11 @@ from app.schemas.enums.health_score_category import HealthScoreCategory
 # not parse for this provider, so no SeriesType values are declared either.
 TIMESERIES: frozenset[SeriesType] = frozenset()
 
-# EventRecordDetail fields populated by workouts.py from workout_summary data
-# (GET /v1/workouts + GET /v1/workouts/{id}). Max heart rate/speed/power and
-# elevation high/low are FIT-file-only and are not populated here.
+# EventRecordDetail fields populated by workouts.py: the base set from workout_summary
+# JSON data (GET /v1/workouts + GET /v1/workouts/{id}), plus a best-effort FIT-file
+# enrichment pass (hr_zones/power_zones/segments and FIT `session`-message aggregates —
+# see app.services.fit_parser.SessionMetrics) that may leave the latter group unset when
+# no FIT file is available for a workout.
 WORKOUT_FIELDS: frozenset[str] = frozenset(
     {
         "heart_rate_avg",
@@ -21,6 +23,18 @@ WORKOUT_FIELDS: frozenset[str] = frozenset(
         "moving_time_seconds",
         "entry_source",
         "label",
+        "hr_zones",
+        "power_zones",
+        "segments",
+        "max_watts",
+        "max_speed",
+        "elev_high",
+        "elev_low",
+        "left_right_balance",
+        "avg_left_pedal_smoothness",
+        "avg_right_pedal_smoothness",
+        "avg_left_torque_effectiveness",
+        "avg_right_torque_effectiveness",
     }
 )
 

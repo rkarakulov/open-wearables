@@ -54,6 +54,14 @@ class WorkoutDetails(EventRecordDetail):
     elev_high: Mapped[numeric_10_3 | None]
     elev_low: Mapped[numeric_10_3 | None]
 
+    # Right-pedal power contribution %, decoded from FIT `left_right_balance`
+    # (see app.services.fit_parser._decode_left_right_balance).
+    left_right_balance: Mapped[numeric_5_2 | None]
+    avg_left_pedal_smoothness: Mapped[numeric_5_2 | None]
+    avg_right_pedal_smoothness: Mapped[numeric_5_2 | None]
+    avg_left_torque_effectiveness: Mapped[numeric_5_2 | None]
+    avg_right_torque_effectiveness: Mapped[numeric_5_2 | None]
+
     segments: Mapped[json_binary | None]
     hr_zones: Mapped[json_binary | None]
     power_zones: Mapped[json_binary | None]

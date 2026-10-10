@@ -74,6 +74,16 @@ WORKOUT_FIELDS: frozenset[str] = frozenset(
         "hr_zones",
         "power_zones",
         "segments",
+        # FIT `session` message aggregates (see app.services.fit_parser.SessionMetrics)
+        "max_watts",
+        "max_speed",
+        "elev_high",
+        "elev_low",
+        "left_right_balance",
+        "avg_left_pedal_smoothness",
+        "avg_right_pedal_smoothness",
+        "avg_left_torque_effectiveness",
+        "avg_right_torque_effectiveness",
     }
 )
 

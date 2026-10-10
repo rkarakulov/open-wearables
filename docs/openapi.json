@@ -14988,6 +14988,7 @@
           "ultrahuman",
           "sensorbio",
           "withings",
+          "wahoo",
           "unknown",
           "internal"
         ],
@@ -19238,6 +19239,65 @@
               }
             ],
             "title": "Elev Low"
+          },
+          "left_right_balance": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Left Right Balance",
+            "description": "Right-pedal power contribution %, from the FIT session message.",
+            "examples": [
+              48.5
+            ]
+          },
+          "avg_left_pedal_smoothness": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Left Pedal Smoothness"
+          },
+          "avg_right_pedal_smoothness": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Right Pedal Smoothness"
+          },
+          "avg_left_torque_effectiveness": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Left Torque Effectiveness"
+          },
+          "avg_right_torque_effectiveness": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Right Torque Effectiveness"
           },
           "hr_zones": {
             "anyOf": [

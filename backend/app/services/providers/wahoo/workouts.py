@@ -17,7 +17,7 @@ from app.schemas.model_crud.activities import (
 )
 from app.schemas.providers.wahoo import WahooWorkoutJSON, WahooWorkoutSummaryJSON
 from app.services.event_record_service import event_record_service
-from app.services.fit_parser import parse_fit_file
+from app.services.fit_parser import parse_fit_file, session_metrics_fields
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.raw_payload_storage import store_fit_file
 from app.utils.structured_logging import log_structured
@@ -271,14 +271,13 @@ class WahooWorkouts(BaseWorkoutsTemplate):
         raw_workout: WahooWorkoutJSON,
         record_id: UUID,
     ) -> None:
-        """Best-effort FIT enrichment: hr_zones/power_zones/segments onto the workout detail.
+        """Best-effort FIT enrichment: hr_zones/power_zones/segments/session metrics
+        (max power/speed/elevation, L/R balance, pedal smoothness, torque
+        effectiveness) onto the workout detail.
 
         The base workout (from workout_summary JSON averages) is already saved by the
         time this runs, so any failure here is logged and swallowed — it must never
         break workout ingestion.
-
-        NOTE: some Wahoo FIT files carry left/right power balance and pedal smoothness,
-        but OW's EventRecordDetail/fit_parser don't model those fields — out of scope here.
         """
         activity_id = str(raw_workout.id)
         try:
@@ -299,7 +298,7 @@ class WahooWorkouts(BaseWorkoutsTemplate):
             store_fit_file(provider="wahoo", fit_bytes=fit_bytes, user_id=str(user_id), activity_id=activity_id)
             fit_result = parse_fit_file(fit_bytes, user_id, source="wahoo")
 
-            if not (fit_result.segments or fit_result.hr_zones or fit_result.power_zones):
+            if not (fit_result.segments or fit_result.hr_zones or fit_result.power_zones or fit_result.session_metrics):
                 return
 
             fields: dict[str, Any] = {"segments": fit_result.segments}
@@ -307,6 +306,7 @@ class WahooWorkouts(BaseWorkoutsTemplate):
                 fields["hr_zones"] = fit_result.hr_zones.model_dump()
             if fit_result.power_zones is not None:
                 fields["power_zones"] = fit_result.power_zones.model_dump()
+            fields.update(session_metrics_fields(fit_result.session_metrics))
 
             event_record_service.event_record_detail_repo.update_workout_fields(db, record_id, fields)
             db.commit()

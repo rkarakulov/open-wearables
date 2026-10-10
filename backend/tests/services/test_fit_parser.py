@@ -5,8 +5,19 @@ import fitdecode
 import pytest
 
 from app.schemas.enums.series_types import SeriesType
-from app.services.fit_parser import FitParseResult, parse_fit_file
-from tests.fixtures.fit_builder import make_cycling_fit, make_running_fit, make_swimming_fit
+from app.services.fit_parser import (
+    FitParseResult,
+    SessionMetrics,
+    _decode_left_right_balance,
+    parse_fit_file,
+    session_metrics_fields,
+)
+from tests.fixtures.fit_builder import (
+    make_cycling_fit,
+    make_cycling_power_fit,
+    make_running_fit,
+    make_swimming_fit,
+)
 
 USER_ID = uuid4()
 DS_ID = uuid4()
@@ -20,6 +31,11 @@ def running() -> FitParseResult:
 @pytest.fixture(scope="module")
 def cycling() -> FitParseResult:
     return parse_fit_file(make_cycling_fit(), USER_ID, DS_ID, source="garmin")
+
+
+@pytest.fixture(scope="module")
+def cycling_power() -> FitParseResult:
+    return parse_fit_file(make_cycling_power_fit(), USER_ID, DS_ID, source="garmin")
 
 
 @pytest.fixture(scope="module")
@@ -149,3 +165,85 @@ class TestInvalidInput:
     def test_garbage_bytes_raises(self) -> None:
         with pytest.raises(fitdecode.FitError):
             parse_fit_file(b"not a fit file at all", uuid4(), uuid4())
+
+
+class TestSessionMetrics:
+    def test_no_session_message_leaves_none(self, cycling: FitParseResult) -> None:
+        # make_cycling_fit has no session message at all
+        assert cycling.session_metrics is None
+
+    def test_running_has_no_power_balance(self, running: FitParseResult) -> None:
+        # make_running_fit has laps but no session message
+        assert running.session_metrics is None
+
+    def test_session_message_populates_metrics(self, cycling_power: FitParseResult) -> None:
+        metrics = cycling_power.session_metrics
+        assert metrics is not None
+        assert metrics.max_watts == Decimal("450")
+        assert metrics.max_speed == Decimal("12.5")
+        assert metrics.elev_high == Decimal("250")
+        assert metrics.elev_low == Decimal("180")
+
+    def test_left_right_balance_decoded_as_right_percent(self, cycling_power: FitParseResult) -> None:
+        metrics = cycling_power.session_metrics
+        assert metrics is not None
+        assert metrics.left_right_balance == Decimal("52")
+
+    def test_pedal_smoothness_and_torque_effectiveness(self, cycling_power: FitParseResult) -> None:
+        metrics = cycling_power.session_metrics
+        assert metrics is not None
+        assert metrics.avg_left_torque_effectiveness == Decimal("80")
+        assert metrics.avg_right_torque_effectiveness == Decimal("82")
+        assert metrics.avg_left_pedal_smoothness == Decimal("20.5")
+        assert metrics.avg_right_pedal_smoothness == Decimal("21.5")
+
+
+class TestDecodeLeftRightBalance:
+    def test_none_raw_returns_none(self) -> None:
+        assert _decode_left_right_balance(None) is None
+
+    def test_right_flag_unset_returns_none(self) -> None:
+        # mask bits set (pct * 100 = 5000) but the "right" flag (0x8000) is NOT set,
+        # so the side the percentage applies to isn't reliable.
+        assert _decode_left_right_balance(5000) is None
+
+    def test_right_flag_set_decodes_percent(self) -> None:
+        raw = 5000 | 0x8000
+        assert _decode_left_right_balance(raw) == Decimal("50")
+
+    def test_non_numeric_raw_returns_none(self) -> None:
+        assert _decode_left_right_balance("not-a-number") is None
+
+
+class TestSessionMetricsFields:
+    def test_none_metrics_returns_empty_dict(self) -> None:
+        assert session_metrics_fields(None) == {}
+
+    def test_filters_out_none_fields(self) -> None:
+        metrics = SessionMetrics(max_watts=Decimal("300"), max_speed=None)
+        assert session_metrics_fields(metrics) == {"max_watts": Decimal("300")}
+
+    def test_all_fields_present(self) -> None:
+        metrics = SessionMetrics(
+            max_watts=Decimal("300"),
+            max_speed=Decimal("10"),
+            elev_high=Decimal("200"),
+            elev_low=Decimal("100"),
+            left_right_balance=Decimal("51"),
+            avg_left_pedal_smoothness=Decimal("20"),
+            avg_right_pedal_smoothness=Decimal("21"),
+            avg_left_torque_effectiveness=Decimal("79"),
+            avg_right_torque_effectiveness=Decimal("81"),
+        )
+        fields = session_metrics_fields(metrics)
+        assert set(fields) == {
+            "max_watts",
+            "max_speed",
+            "elev_high",
+            "elev_low",
+            "left_right_balance",
+            "avg_left_pedal_smoothness",
+            "avg_right_pedal_smoothness",
+            "avg_left_torque_effectiveness",
+            "avg_right_torque_effectiveness",
+        }

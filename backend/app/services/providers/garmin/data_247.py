@@ -28,7 +28,7 @@ from app.schemas.model_crud.activities import (
     TimeSeriesSampleCreate,
 )
 from app.services.event_record_service import event_record_service
-from app.services.fit_parser import parse_fit_file
+from app.services.fit_parser import SessionMetrics, parse_fit_file, session_metrics_fields
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import download_binary_content, make_authenticated_request
 from app.services.providers.garmin.coverage import ACTIVITY_SAMPLE_SERIES, DAILIES_SERIES, EPOCHS_SERIES
@@ -1821,6 +1821,7 @@ class Garmin247Data(Base247DataTemplate):
         segments: list[dict],
         hr_zones: dict | None = None,
         power_zones: dict | None = None,
+        session_metrics: SessionMetrics | None = None,
     ) -> None:
         """Update workout_details fields derived from the FIT file.
 
@@ -1845,6 +1846,7 @@ class Garmin247Data(Base247DataTemplate):
             fields["hr_zones"] = hr_zones
         if power_zones is not None:
             fields["power_zones"] = power_zones
+        fields.update(session_metrics_fields(session_metrics))
         self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
 
     # -------------------------------------------------------------------------
@@ -2006,7 +2008,12 @@ class Garmin247Data(Base247DataTemplate):
                                 error=str(e),
                             )
                             continue
-                        if fit_result.segments or fit_result.hr_zones or fit_result.power_zones:
+                        if (
+                            fit_result.segments
+                            or fit_result.hr_zones
+                            or fit_result.power_zones
+                            or fit_result.session_metrics
+                        ):
                             try:
                                 self._save_fit_workout_fields(
                                     db,
@@ -2015,6 +2022,7 @@ class Garmin247Data(Base247DataTemplate):
                                     fit_result.segments,
                                     hr_zones=fit_result.hr_zones.model_dump() if fit_result.hr_zones else None,
                                     power_zones=fit_result.power_zones.model_dump() if fit_result.power_zones else None,
+                                    session_metrics=fit_result.session_metrics,
                                 )
                             except Exception as e:
                                 log_structured(

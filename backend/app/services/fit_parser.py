@@ -66,6 +66,45 @@ _RECORD_FIELD_MAP: tuple[_FieldMapping, ...] = (
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SessionMetrics:
+    """Whole-activity aggregates read from the FIT `session` message.
+
+    Field names match the `workout_details` columns they are persisted into
+    (``max_power`` → ``max_watts``, ``max_altitude``/``min_altitude`` → ``elev_high``/
+    ``elev_low``) so callers can pass ``session_metrics.__dict__`` straight through to
+    ``EventRecordDetailRepository.update_workout_fields``. Every field is optional —
+    absent on files without a barometric altimeter / power meter, and the cycling
+    dynamics fields (balance, pedal smoothness, torque effectiveness) additionally
+    require an ANT+ power meter capable of reporting left/right data.
+    """
+
+    max_watts: Decimal | None = None
+    max_speed: Decimal | None = None
+    elev_high: Decimal | None = None
+    elev_low: Decimal | None = None
+    # Right-pedal power contribution %, decoded from the FIT `left_right_balance`
+    # bitfield (see `_decode_left_right_balance`). None when the device didn't mark
+    # the value as reliably attributable to a side.
+    left_right_balance: Decimal | None = None
+    avg_left_pedal_smoothness: Decimal | None = None
+    avg_right_pedal_smoothness: Decimal | None = None
+    avg_left_torque_effectiveness: Decimal | None = None
+    avg_right_torque_effectiveness: Decimal | None = None
+
+
+def session_metrics_fields(metrics: SessionMetrics | None) -> dict[str, Decimal]:
+    """Non-None `SessionMetrics` fields, ready to merge into an
+    `EventRecordDetailRepository.update_workout_fields` payload.
+
+    Shared by every FIT-enriching provider (Garmin, Wahoo, ...) so each one doesn't
+    reimplement "dataclass → sparse update dict" filtering.
+    """
+    if metrics is None:
+        return {}
+    return {k: v for k, v in metrics.__dict__.items() if v is not None}
+
+
 @dataclass
 class FitParseResult:
     samples: list[TimeSeriesSampleCreate] = field(default_factory=list)
@@ -73,6 +112,7 @@ class FitParseResult:
     developer_fields_found: list[str] = field(default_factory=list)
     hr_zones: HRZones | None = None
     power_zones: PowerZones | None = None
+    session_metrics: SessionMetrics | None = None
 
 
 def parse_fit_file(
@@ -128,6 +168,10 @@ def parse_fit_file(
                 if seg.get("elapsed_seconds") is not None:
                     result.segments.append(seg)
                 _seg_counters[frame.name] = idx + 1
+
+            elif frame.name == "session":
+                # Multi-sport files may carry more than one session message; last one wins.
+                result.session_metrics = _parse_session_metrics(frame)
 
     result.developer_fields_found = sorted(dev_fields_seen)
     logger.debug(
@@ -298,6 +342,73 @@ def _parse_power_zones(frame: fitdecode.FitDataMessage) -> PowerZones | None:
         zones=[PowerZone(zone=i, seconds=s, max_watts=b) for i, (s, b) in enumerate(entries)],
         ftp_watts=int(raw_ftp) if raw_ftp else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Session message helpers
+# ---------------------------------------------------------------------------
+
+# (fit_field names in priority order, output SessionMetrics field name).
+# Prefers enhanced_* (FIT 2.0 float component) over the uint16 base field, like
+# _RECORD_FIELD_MAP does for per-sample speed/altitude.
+_SESSION_SIMPLE_FIELDS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("max_power",), "max_watts"),
+    (("enhanced_max_speed", "max_speed"), "max_speed"),
+    (("enhanced_max_altitude", "max_altitude"), "elev_high"),
+    (("enhanced_min_altitude", "min_altitude"), "elev_low"),
+    (("avg_left_pedal_smoothness",), "avg_left_pedal_smoothness"),
+    (("avg_right_pedal_smoothness",), "avg_right_pedal_smoothness"),
+    (("avg_left_torque_effectiveness",), "avg_left_torque_effectiveness"),
+    (("avg_right_torque_effectiveness",), "avg_right_torque_effectiveness"),
+)
+
+
+def _session_decimal(v: Any) -> Decimal | None:
+    r = _r2(v)
+    return Decimal(str(r)) if r is not None else None
+
+
+def _decode_left_right_balance(raw: Any) -> Decimal | None:
+    """Decode the FIT session `left_right_balance` field (16-bit bitfield, FIT type
+    ``left_right_balance_100``).
+
+    fitdecode does not auto-scale this field (no `scale=` on its Field definition —
+    the FIT SDK models it as an enum/bitfield, not a plain scaled numeric), so the
+    raw uint16 is decoded manually:
+      - bits 0-13 (mask 0x3FFF): right-leg power contribution %, scaled by 100
+        (e.g. raw 5000 → 50.00%).
+      - bit 15 (0x8000): "right" flag. Per FIT SDK Profile.xlsx, the percentage only
+        reliably corresponds to the right leg when this bit is set; when unset the
+        side is not dependable, so the value is treated as unavailable rather than
+        guessed.
+    """
+    if raw is None:
+        return None
+    try:
+        raw_int = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if not (raw_int & 0x8000):
+        return None
+    return Decimal(raw_int & 0x3FFF) / Decimal(100)
+
+
+def _parse_session_metrics(frame: fitdecode.FitDataMessage) -> SessionMetrics:
+    values: dict[str, Decimal] = {}
+    for fit_fields, out_key in _SESSION_SIMPLE_FIELDS:
+        for fit_name in fit_fields:
+            v = _field_val(frame, fit_name)
+            if v is not None:
+                decoded = _session_decimal(v)
+                if decoded is not None:
+                    values[out_key] = decoded
+                break
+
+    balance = _decode_left_right_balance(_field_val(frame, "left_right_balance"))
+    if balance is not None:
+        values["left_right_balance"] = balance
+
+    return SessionMetrics(**values)
 
 
 def _extract(frame: fitdecode.FitDataMessage, mapping: _FieldMapping) -> Decimal | None:

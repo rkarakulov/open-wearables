@@ -36,6 +36,14 @@ class EventRecordDetailBase(BaseModel):
     elev_high: Decimal | None = None
     elev_low: Decimal | None = None
 
+    # Cycling power-meter session metrics (right-pedal contribution % and
+    # pedal/torque balance); see app.services.fit_parser.SessionMetrics.
+    left_right_balance: Decimal | None = None
+    avg_left_pedal_smoothness: Decimal | None = None
+    avg_right_pedal_smoothness: Decimal | None = None
+    avg_left_torque_effectiveness: Decimal | None = None
+    avg_right_torque_effectiveness: Decimal | None = None
+
     # Sleep-specific fields
     sleep_total_duration_minutes: int | None = None
     sleep_time_in_bed_minutes: int | None = None
