@@ -318,3 +318,72 @@ def make_cycling_power_fit(n_records: int = 10) -> bytes:
         avg_right_smoothness_raw=43,  # 21.5%
     )
     return _fit_file(messages)
+
+
+# ---------------------------------------------------------------------------
+# Session message with per-zone time arrays but NO dedicated time_in_zone message
+# (Wahoo-style). Session fields used here:
+#    16  max_heart_rate     uint8     (bpm)
+#   202  threshold_power    uint16    (watts)
+#    57  time_in_hr_zone    uint32[]  (raw = seconds * 1000; fitdecode applies scale=1000)
+#    60  time_in_power_zone uint32[]  (raw = seconds * 1000)
+# ---------------------------------------------------------------------------
+
+
+def _session_zone_message(
+    ts: int,
+    hr_seconds: list[float],
+    power_seconds: list[float],
+    max_heart_rate: int,
+    threshold_power: int,
+    local_type: int = 1,
+) -> bytes:
+    """Build a FIT session message (global 18) carrying time-in-zone arrays and no
+    dedicated time_in_zone message — mirrors how Wahoo exports zone data."""
+    hr_raw = [int(round(s * 1000)) for s in hr_seconds]
+    pw_raw = [int(round(s * 1000)) for s in power_seconds]
+    fields = [
+        _Field(253, _UINT32, 4),
+        _Field(16, _UINT8, 1),
+        _Field(202, _UINT16, 2),
+        _Field(57, _UINT32, 4 * len(hr_raw)),
+        _Field(60, _UINT32, 4 * len(pw_raw)),
+    ]
+    out = _definition_msg(fields, local_type=local_type, global_num=18)
+    body = bytes([local_type])
+    body += struct.pack("<I", ts)
+    body += struct.pack("<B", max_heart_rate)
+    body += struct.pack("<H", threshold_power)
+    for v in hr_raw:
+        body += struct.pack("<I", v)
+    for v in pw_raw:
+        body += struct.pack("<I", v)
+    return out + body
+
+
+def make_cycling_zones_fit(
+    hr_seconds: list[float] | None = None,
+    power_seconds: list[float] | None = None,
+    max_heart_rate: int = 180,
+    threshold_power: int = 250,
+    n_records: int = 5,
+) -> bytes:
+    """Synthetic cycling ride whose session message carries time_in_hr_zone /
+    time_in_power_zone arrays and no dedicated time_in_zone message (Wahoo-style)."""
+    if hr_seconds is None:
+        hr_seconds = [10.0, 20.0, 30.0]
+    if power_seconds is None:
+        power_seconds = [5.0, 15.0, 25.0]
+    fields = [_Field(253, _UINT32, 4), _Field(3, _UINT8, 1)]
+    start_ts = _fit_ts(datetime(2025, 6, 5, 9, 0, 0, tzinfo=timezone.utc))
+    messages = _definition_msg(fields)
+    for i in range(n_records):
+        messages += _data_msg(fields, [start_ts + i, 140 + i % 10])
+    messages += _session_zone_message(
+        ts=start_ts + n_records,
+        hr_seconds=hr_seconds,
+        power_seconds=power_seconds,
+        max_heart_rate=max_heart_rate,
+        threshold_power=threshold_power,
+    )
+    return _fit_file(messages)

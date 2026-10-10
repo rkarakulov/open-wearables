@@ -15,6 +15,7 @@ from app.services.fit_parser import (
 from tests.fixtures.fit_builder import (
     make_cycling_fit,
     make_cycling_power_fit,
+    make_cycling_zones_fit,
     make_running_fit,
     make_swimming_fit,
 )
@@ -247,3 +248,42 @@ class TestSessionMetricsFields:
             "avg_left_torque_effectiveness",
             "avg_right_torque_effectiveness",
         }
+
+
+class TestSessionZoneFallback:
+    """Zones read from the session message when a FIT has no dedicated time_in_zone
+    message (Wahoo-style): seconds per zone, no boundaries, whole-activity max_hr/FTP."""
+
+    @pytest.fixture(scope="class")
+    def result(self) -> FitParseResult:
+        return parse_fit_file(
+            make_cycling_zones_fit(
+                hr_seconds=[10.0, 20.0, 30.0, 0.0, 0.0],
+                power_seconds=[5.0, 15.0, 25.0],
+                max_heart_rate=182,
+                threshold_power=255,
+            ),
+            USER_ID,
+            DS_ID,
+            source="wahoo",
+        )
+
+    def test_hr_zones_from_session(self, result: FitParseResult) -> None:
+        assert result.hr_zones is not None
+        # trailing all-zero zones stripped
+        assert [z.seconds for z in result.hr_zones.zones] == [10.0, 20.0, 30.0]
+        assert all(z.max_bpm is None for z in result.hr_zones.zones)
+        assert [z.zone for z in result.hr_zones.zones] == [0, 1, 2]
+        assert result.hr_zones.max_hr == 182
+
+    def test_power_zones_from_session(self, result: FitParseResult) -> None:
+        assert result.power_zones is not None
+        assert [z.seconds for z in result.power_zones.zones] == [5.0, 15.0, 25.0]
+        assert all(z.max_watts is None for z in result.power_zones.zones)
+        assert result.power_zones.ftp_watts == 255
+
+    def test_session_without_zone_arrays_stays_none(self, cycling_power: FitParseResult) -> None:
+        # make_cycling_power_fit has a session message but no time-in-zone arrays —
+        # the fallback must not fabricate zones.
+        assert cycling_power.hr_zones is None
+        assert cycling_power.power_zones is None

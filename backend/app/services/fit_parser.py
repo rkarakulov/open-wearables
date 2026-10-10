@@ -124,6 +124,12 @@ def parse_fit_file(
     result = FitParseResult()
     dev_fields_seen: set[str] = set()
     _seg_counters: dict[str, int] = {k: 0 for k in _SEGMENT_KINDS}
+    # Per-zone seconds read off the `session` message (see the session branch below) —
+    # used as a fallback when a FIT file emits no dedicated `time_in_zone` message.
+    session_hr_secs: Any = None
+    session_power_secs: Any = None
+    session_max_hr: Any = None
+    session_threshold_power: Any = None
 
     with fitdecode.FitReader(io.BytesIO(data)) as fit:
         for frame in fit:
@@ -172,6 +178,26 @@ def parse_fit_file(
             elif frame.name == "session":
                 # Multi-sport files may carry more than one session message; last one wins.
                 result.session_metrics = _parse_session_metrics(frame)
+                # Wahoo (and some others) attach time-in-zone to the session message
+                # itself instead of emitting a dedicated time_in_zone message. Capture the
+                # raw per-zone seconds + whole-activity thresholds; converted to zones
+                # after the loop only if no time_in_zone message already supplied them.
+                session_hr_secs = _field_val(frame, "time_in_hr_zone")
+                session_power_secs = _field_val(frame, "time_in_power_zone")
+                session_max_hr = _field_val(frame, "max_heart_rate")
+                session_threshold_power = _field_val(frame, "threshold_power")
+
+    # Session-frame zone fallback (e.g. Wahoo): only when no dedicated time_in_zone
+    # message populated zones. The session message carries no zone boundaries, so each
+    # zone holds seconds only (max_bpm/max_watts left None), with whole-activity max_hr/FTP.
+    if result.hr_zones is None:
+        result.hr_zones = _zones_from_session_times(
+            session_hr_secs, is_power=False, max_hr=session_max_hr
+        )
+    if result.power_zones is None:
+        result.power_zones = _zones_from_session_times(
+            session_power_secs, is_power=True, ftp=session_threshold_power
+        )
 
     result.developer_fields_found = sorted(dev_fields_seen)
     logger.debug(
@@ -341,6 +367,39 @@ def _parse_power_zones(frame: fitdecode.FitDataMessage) -> PowerZones | None:
     return PowerZones(
         zones=[PowerZone(zone=i, seconds=s, max_watts=b) for i, (s, b) in enumerate(entries)],
         ftp_watts=int(raw_ftp) if raw_ftp else None,
+    )
+
+
+def _zones_from_session_times(
+    seconds_tuple: Any,
+    *,
+    is_power: bool,
+    max_hr: Any = None,
+    ftp: Any = None,
+) -> HRZones | PowerZones | None:
+    """Build HR or power zones from a `session` message's time_in_*_zone array.
+
+    Fallback for FIT files that report per-zone seconds on the session message but emit
+    no dedicated `time_in_zone` message (e.g. Wahoo). The session message carries no zone
+    boundaries, so max_bpm/max_watts are left None; trailing all-zero zones are dropped to
+    match the dedicated-message output shape.
+    """
+    if not seconds_tuple:
+        return None
+    entries = [round(float(s), 1) for s in seconds_tuple]
+    while entries and entries[-1] == 0.0:
+        entries.pop()
+    if not entries:
+        return None
+    if is_power:
+        return PowerZones(
+            zones=[PowerZone(zone=i, seconds=s, max_watts=None) for i, s in enumerate(entries)],
+            ftp_watts=int(ftp) if ftp else None,
+        )
+    return HRZones(
+        zones=[HRZone(zone=i, seconds=s, max_bpm=None) for i, s in enumerate(entries)],
+        max_hr=int(max_hr) if max_hr else None,
+        threshold_hr=None,
     )
 
 
