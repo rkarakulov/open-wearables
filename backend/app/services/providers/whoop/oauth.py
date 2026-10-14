@@ -44,39 +44,23 @@ class WhoopOAuth(BaseOAuthTemplate):
     auth_method: AuthenticationMethod = AuthenticationMethod.BODY  # Based on Whoop API docs, credentials in body
 
     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
-        """Fetches Whoop user ID via API."""
-        try:
-            # Whoop API endpoint to get user info
-            user_info_response = httpx.get(
-                f"{self.api_base_url}/v2/user/profile/basic",
-                headers={"Authorization": f"Bearer {token_response.access_token}"},
-                timeout=30.0,
-            )
-            user_info_response.raise_for_status()
-            user_data = user_info_response.json()
-            # Whoop API returns: user_id, email, first_name, last_name
-            provider_user_id = user_data.get("user_id")
-            provider_user_id = str(provider_user_id) if provider_user_id is not None else None
+        """Returns provider user info without touching Whoop PII.
 
-            log_structured(
-                logger,
-                "info",
-                "Fetched Whoop user profile",
-                provider="whoop",
-                task="get_provider_user_info",
-                user_id=user_id,
-            )
-            return {"user_id": provider_user_id, "username": None}
-        except Exception as e:
-            log_structured(
-                logger,
-                "error",
-                f"Failed to fetch Whoop user profile: {e}",
-                provider="whoop",
-                task="get_provider_user_info",
-                user_id=user_id,
-            )
-            return {"user_id": None, "username": None}
+        We deliberately do NOT request the ``read:profile`` scope and do NOT call
+        ``/v2/user/profile/basic`` — that endpoint returns the member's name and email,
+        which we must not collect (see the privacy policy). The provider_user_id it used
+        to supply is not needed: Whoop sync is pull-based, keyed by our internal user_id
+        via the stored tokens, and no Whoop webhook routes by provider_user_id.
+        """
+        log_structured(
+            logger,
+            "info",
+            "Skipping Whoop profile fetch (read:profile not requested; no PII collected)",
+            provider="whoop",
+            task="get_provider_user_info",
+            user_id=user_id,
+        )
+        return {"user_id": None, "username": None}
 
     def deregister_user(self, access_token: str, provider_user_id: str | None = None) -> None:
         """Revoke WHOOP OAuth access for this user."""
