@@ -46,6 +46,11 @@ class BaseOAuthTemplate(ABC):
         self.provider_name = provider_name
         self.api_base_url = api_base_url
         self.state_ttl = 900  # 15 minutes
+        # Remember a state whose callback already completed successfully, so a
+        # duplicate provider callback (observed with Garmin, which redirects to
+        # the callback URL more than once per authorization) is idempotent
+        # instead of failing with "Invalid or expired state parameter".
+        self.completed_state_ttl = self.state_ttl
 
     @property
     def redis_client(self) -> Redis:
@@ -101,8 +106,22 @@ class BaseOAuthTemplate(ABC):
         return auth_url, state
 
     def handle_callback(self, db: DbSession, code: str, state: str) -> OAuthState:
-        """Handles the OAuth callback, exchanges code, and saves the connection."""
-        oauth_state, code_verifier = self._validate_state(state)
+        """Handles the OAuth callback, exchanges code, and saves the connection.
+
+        Idempotent against duplicate provider callbacks: some providers (observed
+        with Garmin) redirect to the callback URL more than once for a single
+        authorization, each time with a different ``code`` but the same ``state``.
+        The first callback consumes the one-time state and completes the flow; any
+        duplicate within the state TTL short-circuits to the same success result
+        instead of failing with "Invalid or expired state parameter".
+        """
+        oauth_state, code_verifier, already_completed = self._validate_state(state)
+
+        if already_completed:
+            # A previous (duplicate) callback already exchanged the code and saved
+            # the connection for this state. Return the same result so the route
+            # redirects to success rather than erroring on the stale code.
+            return oauth_state
 
         if oauth_state.provider != self.provider_name:
             log_structured(
@@ -130,6 +149,8 @@ class BaseOAuthTemplate(ABC):
             task="handle_callback",
             user_id=str(oauth_state.user_id),
         )
+
+        self._mark_state_completed(state, oauth_state)
 
         return oauth_state
 
@@ -261,12 +282,26 @@ class BaseOAuthTemplate(ABC):
 
         return code_verifier, code_challenge
 
-    def _validate_state(self, state: str) -> tuple[OAuthState, str | None]:
-        """Validates and consumes the OAuth state from Redis."""
+    def _validate_state(self, state: str) -> tuple[OAuthState, str | None, bool]:
+        """Validates and consumes the OAuth state from Redis.
+
+        Returns:
+            tuple of ``(oauth_state, code_verifier, already_completed)``. When
+            ``already_completed`` is True the flow for this state was already
+            finished by an earlier (duplicate) callback; the caller must skip the
+            token exchange and return the existing success result. ``code_verifier``
+            is None in that case (and for non-PKCE providers).
+        """
         redis_key = f"oauth_state:{state}"
         state_data = self.redis_client.get(redis_key)
 
         if not state_data:
+            # The one-time state is gone. Distinguish a genuine invalid/expired
+            # state from a duplicate callback whose state was already consumed by
+            # a prior successful callback for the same authorization.
+            completed_state = self._get_completed_state(state)
+            if completed_state is not None:
+                return completed_state, None, True
             raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="Invalid or expired state parameter")
 
         # Delete state immediately (one-time use)
@@ -279,7 +314,26 @@ class BaseOAuthTemplate(ABC):
         oauth_state = OAuthState.model_validate(state_dict)
 
         # code_verifier will be None for non-PKCE providers
-        return oauth_state, code_verifier
+        return oauth_state, code_verifier, False
+
+    def _completed_state_key(self, state: str) -> str:
+        return f"oauth_state_completed:{state}"
+
+    def _mark_state_completed(self, state: str, oauth_state: OAuthState) -> None:
+        """Remember a successfully completed state so duplicate callbacks are idempotent."""
+        self.redis_client.setex(
+            self._completed_state_key(state),
+            self.completed_state_ttl,
+            oauth_state.model_dump_json(),
+        )
+
+    def _get_completed_state(self, state: str) -> OAuthState | None:
+        """Return the OAuthState recorded for an already-completed callback, or None."""
+        data = self.redis_client.get(self._completed_state_key(state))
+        if not data:
+            return None
+        data_str = data.decode("utf-8") if isinstance(data, bytes) else str(data)
+        return OAuthState.model_validate_json(data_str)
 
     def _exchange_token(self, code: str, code_verifier: str | None) -> OAuthTokenResponse:
         """Exchanges authorization code for tokens."""
