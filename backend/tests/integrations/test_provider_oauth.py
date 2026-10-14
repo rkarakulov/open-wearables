@@ -109,6 +109,90 @@ class TestGarminOAuth:
         # Assert
         assert response.status_code in [302, 303, 307, 400, 422]
 
+    @patch("app.integrations.celery.tasks.sync_vendor_data.delay")
+    @patch("httpx.get")
+    @patch("httpx.post")
+    def test_garmin_duplicate_callback_is_idempotent(
+        self,
+        mock_httpx_post: MagicMock,
+        mock_httpx_get: MagicMock,
+        mock_sync_task: MagicMock,
+        client: TestClient,
+        db: Session,
+    ) -> None:
+        """A duplicate Garmin callback (same state, different code) must not 400.
+
+        Garmin redirects to the callback URL more than once for a single
+        authorization, each time with a different ``code`` but the same
+        ``state``. The first callback consumes the one-time state and succeeds;
+        the duplicate must short-circuit to the same success redirect instead
+        of returning HTTP 400 "Invalid or expired state parameter".
+        """
+        from app.integrations.redis_client import get_redis_client
+        from app.services.providers.factory import ProviderFactory
+
+        user = UserFactory()
+
+        # In-memory Redis store so the one-time state survives across the two
+        # callbacks exactly as it would in production.
+        redis_store: dict[str, Any] = {}
+
+        def mock_setex(key: str, ttl: int, value: str) -> bool:
+            redis_store[key] = value
+            return True
+
+        def mock_get(key: str) -> Any:
+            return redis_store.get(key)
+
+        def mock_delete(key: str) -> bool:
+            redis_store.pop(key, None)
+            return True
+
+        redis_client = get_redis_client()
+        redis_client.setex = mock_setex
+        redis_client.get = mock_get
+        redis_client.delete = mock_delete
+
+        factory = ProviderFactory()
+        garmin_strategy = factory.get_provider("garmin")
+        assert garmin_strategy.oauth
+        _auth_url, state = garmin_strategy.oauth.get_authorization_url(user.id)
+
+        # Mock token exchange (base _exchange_token uses httpx.post)
+        token_resp = MagicMock()
+        token_resp.json.return_value = {
+            "access_token": "garmin_access_token",
+            "refresh_token": "garmin_refresh_token",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }
+        token_resp.status_code = 200
+        token_resp.raise_for_status = MagicMock()
+        mock_httpx_post.return_value = token_resp
+
+        # Mock Garmin user-id lookup (httpx.get)
+        userid_resp = MagicMock()
+        userid_resp.json.return_value = {"userId": "garmin_user_123"}
+        userid_resp.status_code = 200
+        userid_resp.raise_for_status = MagicMock()
+        mock_httpx_get.return_value = userid_resp
+
+        # First callback — consumes the one-time state and succeeds.
+        first = client.get(
+            "/api/v1/oauth/garmin/callback",
+            params={"code": "code_first", "state": state},
+            follow_redirects=False,
+        )
+        assert first.status_code == 303, first.text
+
+        # Duplicate callback — same state, different code (as Garmin sends).
+        second = client.get(
+            "/api/v1/oauth/garmin/callback",
+            params={"code": "code_second", "state": state},
+            follow_redirects=False,
+        )
+        assert second.status_code == 303, second.text
+
 
 class TestPolarOAuth:
     """Tests for Polar OAuth flow."""
