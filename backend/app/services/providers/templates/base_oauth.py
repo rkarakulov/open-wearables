@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import secrets
+import time
 from abc import ABC, abstractmethod
 from base64 import b64encode, urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,13 @@ class BaseOAuthTemplate(ABC):
         # the callback URL more than once per authorization) is idempotent
         # instead of failing with "Invalid or expired state parameter".
         self.completed_state_ttl = self.state_ttl
+        # A duplicate callback can also arrive while the first one is still
+        # exchanging the code (Garmin's token endpoint takes seconds). The first
+        # callback claims the state with an in-flight marker; a duplicate waits
+        # for it to finish instead of failing on the already-consumed state.
+        self.inflight_state_ttl = 120
+        self.duplicate_wait_seconds = 20.0
+        self.duplicate_poll_interval = 0.25
 
     @property
     def redis_client(self) -> Redis:
@@ -123,6 +131,24 @@ class BaseOAuthTemplate(ABC):
             # redirects to success rather than erroring on the stale code.
             return oauth_state
 
+        try:
+            self._complete_callback(db, code, state, oauth_state, code_verifier)
+        finally:
+            # Success or failure, the flow is no longer in flight: a waiting
+            # duplicate either finds the completed marker or fails fast.
+            self.redis_client.delete(self._inflight_state_key(state))
+
+        return oauth_state
+
+    def _complete_callback(
+        self,
+        db: DbSession,
+        code: str,
+        state: str,
+        oauth_state: OAuthState,
+        code_verifier: str | None,
+    ) -> None:
+        """Exchanges the code, saves the connection and marks the state completed."""
         if oauth_state.provider != self.provider_name:
             log_structured(
                 logger,
@@ -151,8 +177,6 @@ class BaseOAuthTemplate(ABC):
         )
 
         self._mark_state_completed(state, oauth_state)
-
-        return oauth_state
 
     def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
         """Refreshes the access token using the refresh token."""
@@ -295,11 +319,17 @@ class BaseOAuthTemplate(ABC):
         redis_key = f"oauth_state:{state}"
         state_data = self.redis_client.get(redis_key)
 
-        if not state_data:
-            # The one-time state is gone. Distinguish a genuine invalid/expired
-            # state from a duplicate callback whose state was already consumed by
-            # a prior successful callback for the same authorization.
-            completed_state = self._get_completed_state(state)
+        # Claim the state atomically: of two concurrent callbacks only one may
+        # exchange the code; the other is a duplicate.
+        claimed = bool(state_data) and bool(
+            self.redis_client.set(self._inflight_state_key(state), "1", nx=True, ex=self.inflight_state_ttl)
+        )
+
+        if not claimed:
+            # The one-time state is gone (or another callback holds it). Distinguish
+            # a genuine invalid/expired state from a duplicate callback of the same
+            # authorization, finished or still in flight.
+            completed_state = self._await_completed_state(state)
             if completed_state is not None:
                 return completed_state, None, True
             raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="Invalid or expired state parameter")
@@ -315,6 +345,22 @@ class BaseOAuthTemplate(ABC):
 
         # code_verifier will be None for non-PKCE providers
         return oauth_state, code_verifier, False
+
+    def _inflight_state_key(self, state: str) -> str:
+        return f"oauth_state_inflight:{state}"
+
+    def _await_completed_state(self, state: str) -> OAuthState | None:
+        """The completed state of a duplicate callback, waiting while the first one is in flight."""
+        deadline = time.monotonic() + self.duplicate_wait_seconds
+        while True:
+            completed_state = self._get_completed_state(state)
+            if completed_state is not None:
+                return completed_state
+            if not self.redis_client.exists(self._inflight_state_key(state)):
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(self.duplicate_poll_interval)
 
     def _completed_state_key(self, state: str) -> str:
         return f"oauth_state_completed:{state}"
