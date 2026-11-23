@@ -7,6 +7,7 @@ Tests complete OAuth authorization flows for Garmin, Polar, and Suunto providers
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -109,7 +110,7 @@ class TestGarminOAuth:
         # Assert
         assert response.status_code in [302, 303, 307, 400, 422]
 
-    @patch("app.integrations.celery.tasks.sync_vendor_data.delay")
+    @patch("app.integrations.celery.tasks.start_garmin_full_backfill.delay")
     @patch("httpx.get")
     @patch("httpx.post")
     def test_garmin_duplicate_callback_is_idempotent(
@@ -192,6 +193,85 @@ class TestGarminOAuth:
             follow_redirects=False,
         )
         assert second.status_code == 303, second.text
+
+
+class TestOAuthCallbackInFlightDuplicate:
+    """A duplicate callback arriving while the first one is still exchanging the code."""
+
+    @staticmethod
+    def _oauth_with_slow_exchange(user_id: Any, release: Any, entered: Any) -> tuple[Any, str]:
+        from app.schemas.model_crud.credentials import OAuthTokenResponse
+        from app.services.providers.factory import ProviderFactory
+
+        oauth = ProviderFactory().get_provider("garmin").oauth
+        assert oauth
+        oauth.duplicate_poll_interval = 0.01
+        _auth_url, state = oauth.get_authorization_url(user_id, "https://app.example/return")
+
+        def slow_exchange(code: str, code_verifier: str | None) -> OAuthTokenResponse:
+            entered.set()
+            assert release.wait(5)
+            return OAuthTokenResponse(access_token="a", refresh_token="r", expires_in=3600, token_type="Bearer")
+
+        oauth._exchange_token = slow_exchange  # type: ignore[method-assign]
+        oauth._get_provider_user_info = lambda token, uid: {"user_id": "garmin_user_123"}  # type: ignore[method-assign]
+        oauth._save_connection = MagicMock()  # type: ignore[method-assign]
+        return oauth, state
+
+    def test_duplicate_waits_for_in_flight_callback(self, db: Session) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        release, entered = threading.Event(), threading.Event()
+        oauth, state = self._oauth_with_slow_exchange(UserFactory().id, release, entered)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(oauth.handle_callback, db, "code_first", state)
+            assert entered.wait(5)
+            duplicate = pool.submit(oauth.handle_callback, db, "code_second", state)
+            release.set()
+            first_state = first.result(timeout=10)
+            duplicate_state = duplicate.result(timeout=10)
+
+        assert duplicate_state.redirect_uri == first_state.redirect_uri == "https://app.example/return"
+        assert oauth._save_connection.call_count == 1
+
+    def test_duplicate_fails_when_in_flight_callback_fails(self, db: Session) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from fastapi import HTTPException
+
+        release, entered = threading.Event(), threading.Event()
+        oauth, state = self._oauth_with_slow_exchange(UserFactory().id, release, entered)
+        oauth._save_connection.side_effect = RuntimeError("save failed")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(oauth.handle_callback, db, "code_first", state)
+            assert entered.wait(5)
+            duplicate = pool.submit(oauth.handle_callback, db, "code_second", state)
+            release.set()
+            with pytest.raises(RuntimeError):
+                first.result(timeout=10)
+            with pytest.raises(HTTPException) as error:
+                duplicate.result(timeout=10)
+
+        assert error.value.status_code == 400
+
+    def test_unknown_state_fails_without_waiting(self, db: Session) -> None:
+        import time
+
+        from fastapi import HTTPException
+
+        from app.services.providers.factory import ProviderFactory
+
+        oauth = ProviderFactory().get_provider("garmin").oauth
+        assert oauth
+        started = time.monotonic()
+        with pytest.raises(HTTPException) as error:
+            oauth.handle_callback(db, "code", "unknown-state")
+        assert error.value.status_code == 400
+        assert time.monotonic() - started < 1
 
 
 class TestPolarOAuth:
